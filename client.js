@@ -7,6 +7,8 @@ window.__ModuleLoader__.load({
     const TAB_ID = 'dsh-live-inspector';
     const TAB_KIND = 'git-tree';
     const FILE_ADDRESS_PREFIX = 'dsh-resource://file/';
+    const MAX_RENDERED_DIFF_ROWS = 150;
+    const MAX_LINE_CHARACTERS = 400;
 
     // Global registry of per-session states
     const sessionStates = new Map();
@@ -14,14 +16,19 @@ window.__ModuleLoader__.load({
     let globalCtx = null;
 
     const listeners = new Set();
+    let notifyTimer = null;
     function notify() {
-      for (const listener of listeners) {
-        try {
-          listener();
-        } catch (e) {
-          console.warn('[dsh-live-inspector] listener error:', e);
+      if (notifyTimer) return;
+      notifyTimer = setTimeout(() => {
+        notifyTimer = null;
+        for (const listener of listeners) {
+          try {
+            listener();
+          } catch (e) {
+            console.warn('[dsh-live-inspector] listener error:', e);
+          }
         }
-      }
+      }, 40);
     }
 
     function getSessionState(sid) {
@@ -35,6 +42,7 @@ window.__ModuleLoader__.load({
           filter: 'all',
           searchQuery: '',
           selectedPath: null,
+          processedSeqs: new Set(),
           autoOpenOpenedThisTurn: false,
           reviewUrl: null
         };
@@ -44,7 +52,7 @@ window.__ModuleLoader__.load({
     }
 
     function resolveCurrentSessionId() {
-      // Strategy 1: Session currently displayed in Main View
+      // 1. Session currently visible in Main View
       try {
         const list = globalCtx?.sessions?.list?.getSnapshot();
         if (list && list.byId) {
@@ -56,13 +64,13 @@ window.__ModuleLoader__.load({
         }
       } catch {}
 
-      // Strategy 2: sidebarRight mounted session
+      // 2. sidebarRight mounted session
       try {
         const sid = globalCtx?.sidebarRight?.mounted?.getSnapshot();
         if (sid) return sid;
       } catch {}
 
-      // Strategy 3: Cached or first session
+      // 3. Fallback to cached or first available session
       if (currentMountedSessionId) return currentMountedSessionId;
       try {
         const ids = globalCtx?.sessions?.list?.getSnapshot()?.ids;
@@ -83,7 +91,7 @@ window.__ModuleLoader__.load({
       return FILE_ADDRESS_PREFIX + 'session/' + encodeSegment(sessionId) + '/' + encodePath(normalized);
     }
 
-    // High-precision token/word-level diff for intra-line changes (VS Code / GitHub style)
+    // High-precision token/word-level diff with guard against huge lines
     function wordDiff(oldStr, newStr) {
       if (!oldStr && !newStr) return { oldParts: [], newParts: [] };
       if (!oldStr) return { oldParts: [], newParts: [{ text: newStr, changed: true }] };
@@ -92,6 +100,14 @@ window.__ModuleLoader__.load({
         return {
           oldParts: [{ text: oldStr, changed: false }],
           newParts: [{ text: newStr, changed: false }]
+        };
+      }
+
+      // Performance cap on extremely long minified lines
+      if (oldStr.length > MAX_LINE_CHARACTERS || newStr.length > MAX_LINE_CHARACTERS) {
+        return {
+          oldParts: [{ text: oldStr.slice(0, MAX_LINE_CHARACTERS) + (oldStr.length > MAX_LINE_CHARACTERS ? '…' : ''), changed: true }],
+          newParts: [{ text: newStr.slice(0, MAX_LINE_CHARACTERS) + (newStr.length > MAX_LINE_CHARACTERS ? '…' : ''), changed: true }]
         };
       }
 
@@ -135,38 +151,38 @@ window.__ModuleLoader__.load({
       };
     }
 
-    // Professional line-aligned split diff calculation with word-level highlights
+    // Professional line-aligned split diff calculation
     function computeSplitDiff(oldText, newText, startLine = 1) {
-      const oldLines = typeof oldText === 'string' ? oldText.split('\n') : [];
-      const newLines = typeof newText === 'string' ? newText.split('\n') : [];
+      let rawOldLines = typeof oldText === 'string' ? oldText.split('\n') : [];
+      let rawNewLines = typeof newText === 'string' ? newText.split('\n') : [];
 
       let prefixCount = 0;
-      while (prefixCount < oldLines.length && prefixCount < newLines.length && oldLines[prefixCount] === newLines[prefixCount]) {
+      while (prefixCount < rawOldLines.length && prefixCount < rawNewLines.length && rawOldLines[prefixCount] === rawNewLines[prefixCount]) {
         prefixCount++;
       }
 
       let suffixCount = 0;
       while (
-        suffixCount < (oldLines.length - prefixCount) &&
-        suffixCount < (newLines.length - prefixCount) &&
-        oldLines[oldLines.length - 1 - suffixCount] === newLines[newLines.length - 1 - suffixCount]
+        suffixCount < (rawOldLines.length - prefixCount) &&
+        suffixCount < (rawNewLines.length - prefixCount) &&
+        rawOldLines[rawOldLines.length - 1 - suffixCount] === rawNewLines[rawNewLines.length - 1 - suffixCount]
       ) {
         suffixCount++;
       }
 
-      const oldDiff = oldLines.slice(prefixCount, oldLines.length - suffixCount);
-      const newDiff = newLines.slice(prefixCount, newLines.length - suffixCount);
+      const oldDiff = rawOldLines.slice(prefixCount, rawOldLines.length - suffixCount);
+      const newDiff = rawNewLines.slice(prefixCount, rawNewLines.length - suffixCount);
 
       const rows = [];
       let curOldNo = startLine;
       let curNewNo = startLine;
 
-      // Prefix context lines (up to 3 lines)
+      // Prefix context lines (up to 3)
       const contextPrefixStart = Math.max(0, prefixCount - 3);
       for (let i = contextPrefixStart; i < prefixCount; i++) {
         rows.push({
-          left: { no: curOldNo + i, text: oldLines[i], kind: 'context', parts: [{ text: oldLines[i], changed: false }] },
-          right: { no: curNewNo + i, text: newLines[i], kind: 'context', parts: [{ text: newLines[i], changed: false }] }
+          left: { no: curOldNo + i, text: rawOldLines[i], kind: 'context', parts: [{ text: rawOldLines[i], changed: false }] },
+          right: { no: curNewNo + i, text: rawNewLines[i], kind: 'context', parts: [{ text: rawNewLines[i], changed: false }] }
         });
       }
       curOldNo += prefixCount;
@@ -206,21 +222,26 @@ window.__ModuleLoader__.load({
       curOldNo += oldDiff.length;
       curNewNo += newDiff.length;
 
-      // Suffix context lines (up to 3 lines)
+      // Suffix context lines (up to 3)
       const suffixLines = Math.min(3, suffixCount);
       for (let i = 0; i < suffixLines; i++) {
-        const oldIdx = oldLines.length - suffixCount + i;
-        const newIdx = newLines.length - suffixCount + i;
+        const oldIdx = rawOldLines.length - suffixCount + i;
+        const newIdx = rawNewLines.length - suffixCount + i;
         rows.push({
-          left: { no: curOldNo + i, text: oldLines[oldIdx], kind: 'context', parts: [{ text: oldLines[oldIdx], changed: false }] },
-          right: { no: curNewNo + i, text: newLines[newIdx], kind: 'context', parts: [{ text: newLines[newIdx], changed: false }] }
+          left: { no: curOldNo + i, text: rawOldLines[oldIdx], kind: 'context', parts: [{ text: rawOldLines[oldIdx], changed: false }] },
+          right: { no: curNewNo + i, text: rawNewLines[newIdx], kind: 'context', parts: [{ text: rawNewLines[newIdx], changed: false }] }
         });
       }
 
+      const truncated = rows.length > MAX_RENDERED_DIFF_ROWS;
+      const displayRows = truncated ? rows.slice(0, MAX_RENDERED_DIFF_ROWS) : rows;
+
       return {
-        rows,
-        oldLinesCount: oldLines.length,
-        newLinesCount: newLines.length,
+        rows: displayRows,
+        totalRows: rows.length,
+        truncated: truncated,
+        oldLinesCount: rawOldLines.length,
+        newLinesCount: rawNewLines.length,
         delCount: oldDiff.length,
         addCount: newDiff.length
       };
@@ -250,7 +271,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // Extension Badge / Icon
+    // Extension Badge
     function FileExtBadge({ ext }) {
       let bg = 'rgba(255,255,255,0.06)';
       let color = 'inherit';
@@ -357,7 +378,7 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    function recordFile(sessionId, filePath, status, line, diff) {
+    function recordFile(sessionId, filePath, status, line, diff, seq) {
       const state = getSessionState(sessionId);
       if (!state) return;
 
@@ -382,14 +403,19 @@ window.__ModuleLoader__.load({
       }
 
       const diffs = existing?.diffs ? [...existing.diffs] : [];
-      if (diff && (diff.oldText || diff.newText)) {
-        diffs.push({
-          oldText: diff.oldText,
-          newText: diff.newText,
-          isNewFile: diff.isNewFile || false,
-          line: line || 1,
-          time: Date.now()
-        });
+      if (diff && (diff.oldText !== null || diff.newText !== null)) {
+        const diffId = seq ? 'seq-' + seq : String(diff.oldText || '') + '->' + String(diff.newText || '');
+        const alreadyExists = diffs.some(d => d.id === diffId);
+        if (!alreadyExists) {
+          diffs.push({
+            id: diffId,
+            oldText: diff.oldText,
+            newText: diff.newText,
+            isNewFile: diff.isNewFile || false,
+            line: line || 1,
+            time: Date.now()
+          });
+        }
       }
 
       state.files[cleanPath] = {
@@ -428,7 +454,7 @@ window.__ModuleLoader__.load({
       if (changed) notify();
     }
 
-    function openSingleFile(sessionId, filePath, line, tabActions) {
+    function openSingleFile(sessionId, filePath, line) {
       if (!sessionId) {
         console.warn('[dsh-live-inspector] Cannot open file: no active session');
         return;
@@ -437,14 +463,6 @@ window.__ModuleLoader__.load({
       const options = line ? { params: { line } } : undefined;
       console.info('[dsh-live-inspector] Opening file:', url, options);
 
-      if (tabActions && typeof tabActions.openResource === 'function') {
-        try {
-          tabActions.openResource(url, options);
-          return;
-        } catch (e) {
-          console.warn('[dsh-live-inspector] tabActions.openResource error:', e);
-        }
-      }
       if (globalCtx?.sidebarRight && typeof globalCtx.sidebarRight.openResourceIn === 'function') {
         try {
           globalCtx.sidebarRight.openResourceIn(sessionId, url, options);
@@ -463,15 +481,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function openResourceUrl(sessionId, url, tabActions) {
-      if (tabActions && typeof tabActions.openResource === 'function') {
-        try {
-          tabActions.openResource(url);
-          return;
-        } catch (e) {
-          console.warn('[dsh-live-inspector] tabActions.openResource error:', e);
-        }
-      }
+    function openResourceUrl(sessionId, url) {
       if (globalCtx?.sidebarRight && typeof globalCtx.sidebarRight.openResourceIn === 'function') {
         try {
           globalCtx.sidebarRight.openResourceIn(sessionId, url);
@@ -519,9 +529,9 @@ window.__ModuleLoader__.load({
       });
     }
 
-    // Professional Side-by-Side Split Diff View with word-level highlight & synced rows
+    // Side-by-Side Split Diff View
     function SplitDiffView({ computed, wrapLines }) {
-      const { rows } = computed;
+      const { rows, truncated, totalRows } = computed;
       const emptyHatch = 'repeating-linear-gradient(45deg, rgba(255,255,255,0.015), rgba(255,255,255,0.015) 6px, rgba(0,0,0,0.1) 6px, rgba(0,0,0,0.1) 12px)';
 
       return h('div', {
@@ -536,7 +546,7 @@ window.__ModuleLoader__.load({
           background: 'var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.28))'
         }
       },
-        // Column Left Header (Original / Before)
+        // Left Column Header (Original / Before)
         h('div', {
           style: {
             gridColumn: '1 / 2',
@@ -556,7 +566,7 @@ window.__ModuleLoader__.load({
           h('span', { style: { opacity: 0.8, fontSize: '9px' } }, '-' + computed.delCount + ' lines')
         ),
 
-        // Column Right Header (Modified / After)
+        // Right Column Header (Modified / After)
         h('div', {
           style: {
             gridColumn: '2 / 3',
@@ -607,7 +617,6 @@ window.__ModuleLoader__.load({
                   background: left ? (left.kind === 'del' ? 'rgba(239, 68, 68, 0.08)' : 'transparent') : emptyHatch
                 }
               },
-                // Gutter number
                 h('div', {
                   style: {
                     width: '36px',
@@ -621,7 +630,6 @@ window.__ModuleLoader__.load({
                     borderRight: '1px solid rgba(255,255,255,0.05)'
                   }
                 }, left ? String(left.no) : ''),
-                // Content text with word-level highlight
                 h('div', {
                   style: {
                     flex: 1,
@@ -642,7 +650,6 @@ window.__ModuleLoader__.load({
                   background: right ? (right.kind === 'add' ? 'rgba(16, 185, 129, 0.08)' : 'transparent') : emptyHatch
                 }
               },
-                // Gutter number
                 h('div', {
                   style: {
                     width: '36px',
@@ -656,7 +663,6 @@ window.__ModuleLoader__.load({
                     borderRight: '1px solid rgba(255,255,255,0.05)'
                   }
                 }, right ? String(right.no) : ''),
-                // Content text with word-level highlight
                 h('div', {
                   style: {
                     flex: 1,
@@ -669,14 +675,25 @@ window.__ModuleLoader__.load({
                 }, right ? renderParts(right.parts, right.kind) : '')
               )
             );
-          })
+          }),
+
+          truncated ? h('div', {
+            style: {
+              padding: '6px 12px',
+              color: 'var(--dsw-alias-label-tertiary, #888)',
+              fontStyle: 'italic',
+              fontSize: '11px',
+              textAlign: 'center',
+              background: 'rgba(0,0,0,0.2)'
+            }
+          }, '... and ' + (totalRows - MAX_RENDERED_DIFF_ROWS) + ' more lines (open editor to view full file)') : null
         )
       );
     }
 
-    // Professional Unified Diff View with word-level highlight
+    // Unified Diff View
     function UnifiedDiffView({ computed, wrapLines }) {
-      const { rows } = computed;
+      const { rows, truncated, totalRows } = computed;
 
       return h('div', {
         style: {
@@ -748,12 +765,23 @@ window.__ModuleLoader__.load({
             ));
           }
           return elements;
-        })
+        }),
+
+        truncated ? h('div', {
+          style: {
+            padding: '6px 12px',
+            color: 'var(--dsw-alias-label-tertiary, #888)',
+            fontStyle: 'italic',
+            fontSize: '11px',
+            textAlign: 'center',
+            background: 'rgba(0,0,0,0.2)'
+          }
+        }, '... and ' + (totalRows - MAX_RENDERED_DIFF_ROWS) + ' more lines (open editor to view full file)') : null
       );
     }
 
     // Detail Inspector for the Selected File
-    function SelectedFileDiffInspector({ file, currentSid, tabActions }) {
+    function SelectedFileDiffInspector({ file, currentSid }) {
       const [viewMode, setViewMode] = React.useState('split'); // 'split' | 'unified'
       const [wrapLines, setWrapLines] = React.useState(true);
       const [activeDiffIdx, setActiveDiffIdx] = React.useState(0);
@@ -780,7 +808,7 @@ window.__ModuleLoader__.load({
       const computed = React.useMemo(() => {
         if (!currentDiff) return null;
         return computeSplitDiff(currentDiff.oldText, currentDiff.newText, currentDiff.line || 1);
-      }, [currentDiff]);
+      }, [currentDiff?.id, currentDiff?.oldText, currentDiff?.newText]);
 
       return h('div', {
         style: {
@@ -804,7 +832,7 @@ window.__ModuleLoader__.load({
             gap: '8px'
           }
         },
-          // Left: File Identity & Breadcrumbs
+          // Left: Identity & Badges
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 } },
             h(FileExtBadge, { ext: file.ext }),
             h('span', {
@@ -828,9 +856,8 @@ window.__ModuleLoader__.load({
             computed ? h(DiffStatBar, { addCount: computed.addCount, delCount: computed.delCount }) : null
           ),
 
-          // Right: Action buttons & Layout toggles
+          // Right: Action buttons
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
-            // Wrap toggle
             hasDiffs ? h('button', {
               onClick: () => setWrapLines(v => !v),
               title: wrapLines ? 'Disable line wrapping' : 'Enable line wrapping',
@@ -845,7 +872,6 @@ window.__ModuleLoader__.load({
               }
             }, 'Wrap') : null,
 
-            // View Mode Toggle (Split 2-cột vs Unified 1-cột)
             hasDiffs ? h('div', {
               style: {
                 display: 'flex',
@@ -885,9 +911,8 @@ window.__ModuleLoader__.load({
               }, '☰ Unified')
             ) : null,
 
-            // Open full file in editor
             h('button', {
-              onClick: () => openSingleFile(currentSid, file.path, file.line, tabActions),
+              onClick: () => openSingleFile(currentSid, file.path, file.line),
               title: 'Open full file in Editor',
               style: {
                 padding: '3px 8px',
@@ -903,7 +928,7 @@ window.__ModuleLoader__.load({
           )
         ),
 
-        // Multiple Edits Step Tabs (if file edited multiple times)
+        // Revisions tabs if multiple edits
         diffs.length > 1 ? h('div', {
           style: {
             display: 'flex',
@@ -917,7 +942,7 @@ window.__ModuleLoader__.load({
           h('span', { style: { fontSize: '10px', color: 'var(--dsw-alias-label-tertiary, #777)' } }, 'Revisions:'),
           diffs.map((d, idx) =>
             h('button', {
-              key: idx,
+              key: d.id || idx,
               onClick: () => setActiveDiffIdx(idx),
               style: {
                 padding: '2px 8px',
@@ -969,11 +994,9 @@ window.__ModuleLoader__.load({
           setTick(t => t + 1);
         };
         const unsubMounted = globalCtx?.sidebarRight?.mounted?.subscribe(sync);
-        const unsubList = globalCtx?.sessions?.list?.subscribe(sync);
         listeners.add(sync);
         return () => {
           if (unsubMounted) unsubMounted();
-          if (unsubList) unsubList();
           listeners.delete(sync);
         };
       }, []);
@@ -1000,36 +1023,26 @@ window.__ModuleLoader__.load({
 
     // Main Tab Body Component
     function GitTreeBody(props) {
-      let tabInfo = null;
-      if (props && typeof props.useTabInfo === 'function') {
-        try {
-          tabInfo = props.useTabInfo();
-        } catch {
-          // outside tab scope
-        }
-      }
-
-      const [activeSid, setActiveSid] = React.useState(resolveCurrentSessionId);
+      const propSid = props?.sessionId;
+      const [activeSid, setActiveSid] = React.useState(() => propSid || resolveCurrentSessionId());
       const [, setTick] = React.useState(0);
       const [listCollapsed, setListCollapsed] = React.useState(false);
 
       React.useEffect(() => {
         const sync = () => {
-          const sid = resolveCurrentSessionId();
+          const sid = propSid || resolveCurrentSessionId();
           setActiveSid(sid);
           setTick(t => t + 1);
         };
         const unsubMounted = globalCtx?.sidebarRight?.mounted?.subscribe(sync);
-        const unsubList = globalCtx?.sessions?.list?.subscribe(sync);
         listeners.add(sync);
         return () => {
           if (unsubMounted) unsubMounted();
-          if (unsubList) unsubList();
           listeners.delete(sync);
         };
-      }, []);
+      }, [propSid]);
 
-      const currentSid = activeSid || resolveCurrentSessionId();
+      const currentSid = propSid || activeSid || resolveCurrentSessionId();
       const sessionData = getSessionState(currentSid);
 
       const [filter, setFilter] = React.useState(sessionData ? sessionData.filter : 'all');
@@ -1040,14 +1053,12 @@ window.__ModuleLoader__.load({
       const addedFiles = fileList.filter(f => f.status === 'A');
       const readFiles = fileList.filter(f => f.status === 'R');
 
-      // Auto select first modified file if none selected
       if (sessionData && !sessionData.selectedPath && fileList.length > 0) {
         sessionData.selectedPath = (modifiedFiles[0] || addedFiles[0] || fileList[0]).path;
       }
 
       const selectedFile = sessionData && sessionData.selectedPath ? sessionData.files[sessionData.selectedPath] : null;
 
-      // Filter files
       let visible = fileList;
       if (filter === 'changes') {
         visible = visible.filter(f => f.status === 'M' || f.status === 'A');
@@ -1083,8 +1094,6 @@ window.__ModuleLoader__.load({
           notify();
         }
       }
-
-      const tabActions = tabInfo?.tab?.actions;
 
       return h('div', {
         style: {
@@ -1126,9 +1135,8 @@ window.__ModuleLoader__.load({
             ),
 
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
-              // Full side-by-side review button
               sessionData?.reviewUrl ? h('button', {
-                onClick: () => openResourceUrl(currentSid, sessionData.reviewUrl, tabActions),
+                onClick: () => openResourceUrl(currentSid, sessionData.reviewUrl),
                 title: 'Open full turn review in comparison tab',
                 style: {
                   background: 'rgba(37, 99, 235, 0.16)',
@@ -1207,7 +1215,7 @@ window.__ModuleLoader__.load({
             }, sessionData.activePath)
           ) : null,
 
-          // Filter chips & Search (only if list not collapsed)
+          // Filter chips & Search
           !listCollapsed ? h('div', null,
             h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
               h('button', {
@@ -1284,7 +1292,7 @@ window.__ModuleLoader__.load({
           ) : null
         ),
 
-        // Files Tree List Pane (Top / Master)
+        // Files Tree List Pane (Top)
         !listCollapsed ? h('div', {
           style: {
             maxHeight: '190px',
@@ -1337,7 +1345,6 @@ window.__ModuleLoader__.load({
                   flex: 1
                 }
               },
-                // Status badge
                 h('span', {
                   title: f.status === 'M' ? 'Modified' : f.status === 'A' ? 'Created' : 'Read',
                   style: {
@@ -1357,7 +1364,6 @@ window.__ModuleLoader__.load({
                   }
                 }, badgeStyle.label),
 
-                // Name and folder
                 h('div', {
                   style: {
                     minWidth: 0,
@@ -1384,7 +1390,6 @@ window.__ModuleLoader__.load({
                 )
               ),
 
-              // Badges & Actions
               h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 } },
                 diffCount > 0 ? h('span', {
                   style: {
@@ -1399,7 +1404,7 @@ window.__ModuleLoader__.load({
                 h('button', {
                   onClick: (e) => {
                     e.stopPropagation();
-                    openSingleFile(currentSid, f.path, f.line, tabActions);
+                    openSingleFile(currentSid, f.path, f.line);
                   },
                   title: 'Open in Editor',
                   style: {
@@ -1417,13 +1422,53 @@ window.__ModuleLoader__.load({
           })
         ) : null,
 
-        // Selected File Diff Inspector (Bottom / Detail Pane)
+        // Selected File Diff Inspector (Bottom)
         h(SelectedFileDiffInspector, {
           file: selectedFile,
-          currentSid,
-          tabActions
+          currentSid
         })
       );
+    }
+
+    // React Error Boundary Component to guarantee no white screens ever
+    class SafeGitTreeBody extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { hasError: false, error: null };
+      }
+      static getDerivedStateFromError(error) {
+        return { hasError: true, error: error };
+      }
+      componentDidCatch(error, info) {
+        console.error('[dsh-live-inspector] Caught render error:', error, info);
+      }
+      render() {
+        if (this.state.hasError) {
+          return h('div', {
+            style: {
+              padding: '24px 16px',
+              fontFamily: 'sans-serif',
+              color: 'var(--dsw-alias-label-primary, inherit)'
+            }
+          },
+            h('div', { style: { color: '#ef4444', fontWeight: 600, marginBottom: '6px' } }, '⚠️ Live Inspector encountered a rendering issue'),
+            h('div', { style: { fontSize: '11px', color: '#888', marginBottom: '12px' } }, String(this.state.error?.message || this.state.error)),
+            h('button', {
+              onClick: () => this.setState({ hasError: false, error: null }),
+              style: {
+                padding: '4px 12px',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                background: 'var(--dsw-alias-brand-primary, #2563eb)',
+                color: '#fff',
+                border: 'none',
+                fontSize: '12px'
+              }
+            }, 'Reload View')
+          );
+        }
+        return h(GitTreeBody, this.props);
+      }
     }
 
     return {
@@ -1455,7 +1500,7 @@ window.__ModuleLoader__.load({
           return ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
             name: 'sidebar.right.pane.tab',
             key: TAB_ID
-          }, GitTreeBody));
+          }, SafeGitTreeBody));
         }, 'dsh-live-inspector: git-tree body slot');
 
         // Register live tab title into sidebar.right.pane.tab.title
@@ -1479,7 +1524,6 @@ window.__ModuleLoader__.load({
               ctx.sidebarRight.openTab(TAB_KIND);
             }
           } catch (e) {
-            // Safe fallback if sidebar not mounted yet
             console.debug('[dsh-live-inspector] openTab deferred:', e);
           }
         }
@@ -1487,13 +1531,20 @@ window.__ModuleLoader__.load({
         function processEntries(sessionId, entries, isInitialScan = false) {
           if (!Array.isArray(entries) || entries.length === 0) return;
           const sessionData = getSessionState(sessionId);
+          if (!sessionData) return;
 
           for (const entry of entries) {
             if (!entry || entry.type !== 'event' || !entry.event) continue;
             const ev = entry.event;
 
+            // Strict sequence de-duplication: each event is processed exactly once
+            if (typeof ev.seq === 'number') {
+              if (sessionData.processedSeqs.has(ev.seq)) continue;
+              sessionData.processedSeqs.add(ev.seq);
+            }
+
             if (ev.type === 'turn/start') {
-              if (!isInitialScan && sessionData) {
+              if (!isInitialScan) {
                 sessionData.autoOpenOpenedThisTurn = false;
               }
               clearActive(sessionId);
@@ -1503,7 +1554,7 @@ window.__ModuleLoader__.load({
               const toolName = ev.data.name;
               const extracted = extractFilePathAndDiff(toolName, ev.data.arguments);
               if (extracted && extracted.path) {
-                recordFile(sessionId, extracted.path, extracted.status, extracted.line, extracted.diff);
+                recordFile(sessionId, extracted.path, extracted.status, extracted.line, extracted.diff, ev.seq);
                 if (!isInitialScan) {
                   ensureTabOpen(sessionId);
                 }
@@ -1513,7 +1564,7 @@ window.__ModuleLoader__.load({
             if (ev.type === 'tool/result' && ev.data && ev.data.meta && Array.isArray(ev.data.meta.diffs)) {
               for (const df of ev.data.meta.diffs) {
                 if (df && df.path) {
-                  recordFile(sessionId, df.path, 'M', undefined, { oldText: df.oldText, newText: df.newText });
+                  recordFile(sessionId, df.path, 'M', undefined, { oldText: df.oldText, newText: df.newText }, ev.seq);
                 }
               }
             }
@@ -1523,9 +1574,7 @@ window.__ModuleLoader__.load({
             }
 
             if (ev.type === 'workspace/changes' && ev.data && typeof ev.data.turn === 'number') {
-              if (sessionData) {
-                sessionData.reviewUrl = 'dsh-resource://changes-review/session/' + encodeSegment(sessionId) + '/' + ev.seq + '/' + ev.data.turn;
-              }
+              sessionData.reviewUrl = 'dsh-resource://changes-review/session/' + encodeSegment(sessionId) + '/' + ev.seq + '/' + ev.data.turn;
             }
           }
 
@@ -1538,20 +1587,23 @@ window.__ModuleLoader__.load({
           try {
             const binding = ctx.sessions?.binding(sessionId);
             if (binding && binding.eventSource && typeof binding.eventSource.subscribe === 'function') {
-              // 1. Scan historical entries immediately upon bind
+              // Initial scan of historical entries
               const initialSnapshot = binding.eventSource.getSnapshot();
               if (initialSnapshot && Array.isArray(initialSnapshot.entries)) {
                 processEntries(sessionId, initialSnapshot.entries, true);
               }
 
-              // 2. Subscribe to subsequent real-time changes
+              // Subscribe to real-time events
               const unsub = binding.eventSource.subscribe(() => {
                 const snapshot = binding.eventSource.getSnapshot();
                 if (!snapshot) return;
                 const change = snapshot.change;
                 if (change && Array.isArray(change.entries)) {
                   processEntries(sessionId, change.entries, false);
+                } else if (change && change.kind === 'settle-assistant' && change.entry) {
+                  processEntries(sessionId, [change.entry], false);
                 } else if (Array.isArray(snapshot.entries)) {
+                  // Fallback: processEntries automatically filters via processedSeqs
                   processEntries(sessionId, snapshot.entries, false);
                 }
               });
@@ -1622,7 +1674,7 @@ window.__ModuleLoader__.load({
           }, 'dsh-live-inspector: session watcher');
         }
 
-        console.info('[dsh-live-inspector] Professional Master-Detail Source Control & Split Diff active.');
+        console.info('[dsh-live-inspector] Fully guarded & de-duplicated Git Tree active.');
       }
     };
   }
