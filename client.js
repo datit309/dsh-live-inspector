@@ -35,7 +35,6 @@ window.__ModuleLoader__.load({
           filter: 'all',
           searchQuery: '',
           selectedPath: null,
-          viewLayout: 'tree', // 'tree' | 'flat'
           autoOpenOpenedThisTurn: false,
           reviewUrl: null
         };
@@ -45,15 +44,32 @@ window.__ModuleLoader__.load({
     }
 
     function resolveCurrentSessionId() {
-      if (globalCtx?.sidebarRight?.mounted && typeof globalCtx.sidebarRight.mounted.getSnapshot === 'function') {
-        const sid = globalCtx.sidebarRight.mounted.getSnapshot();
+      // Strategy 1: Session currently displayed in Main View
+      try {
+        const list = globalCtx?.sessions?.list?.getSnapshot();
+        if (list && list.byId) {
+          for (const id in list.byId) {
+            if ((list.byId[id]?.retainedBy?.mainView ?? 0) > 0) {
+              return id;
+            }
+          }
+        }
+      } catch {}
+
+      // Strategy 2: sidebarRight mounted session
+      try {
+        const sid = globalCtx?.sidebarRight?.mounted?.getSnapshot();
         if (sid) return sid;
-      }
-      if (globalCtx?.uiSession?.adapter?.current && typeof globalCtx.uiSession.adapter.current.getSnapshot === 'function') {
-        const sid = globalCtx.uiSession.adapter.current.getSnapshot()?.key;
-        if (sid) return sid;
-      }
-      return currentMountedSessionId;
+      } catch {}
+
+      // Strategy 3: Cached or first session
+      if (currentMountedSessionId) return currentMountedSessionId;
+      try {
+        const ids = globalCtx?.sessions?.list?.getSnapshot()?.ids;
+        if (ids && ids.length > 0) return ids[0];
+      } catch {}
+
+      return null;
     }
 
     function encodeSegment(s) {
@@ -238,7 +254,7 @@ window.__ModuleLoader__.load({
     function FileExtBadge({ ext }) {
       let bg = 'rgba(255,255,255,0.06)';
       let color = 'inherit';
-      let label = ext.toUpperCase().slice(0, 4);
+      let label = (ext || '').toUpperCase().slice(0, 4);
 
       if (ext === 'ts' || ext === 'tsx') {
         bg = 'rgba(49, 120, 198, 0.2)';
@@ -393,8 +409,6 @@ window.__ModuleLoader__.load({
       if (!state.selectedPath || nextStatus === 'M' || nextStatus === 'A') {
         state.selectedPath = cleanPath;
       }
-
-      notify();
     }
 
     function clearActive(sessionId) {
@@ -476,7 +490,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // Render word-diff parts
     function renderParts(parts, kind) {
       if (!parts || parts.length === 0) return null;
       return parts.map((p, i) => {
@@ -950,16 +963,18 @@ window.__ModuleLoader__.load({
       const [, setTick] = React.useState(0);
 
       React.useEffect(() => {
-        const syncSid = () => {
+        const sync = () => {
           const sid = resolveCurrentSessionId();
           setActiveSid(sid);
+          setTick(t => t + 1);
         };
-        const unsub = globalCtx?.sidebarRight?.mounted?.subscribe(syncSid);
-        const cb = () => setTick(t => t + 1);
-        listeners.add(cb);
+        const unsubMounted = globalCtx?.sidebarRight?.mounted?.subscribe(sync);
+        const unsubList = globalCtx?.sessions?.list?.subscribe(sync);
+        listeners.add(sync);
         return () => {
-          if (unsub) unsub();
-          listeners.delete(cb);
+          if (unsubMounted) unsubMounted();
+          if (unsubList) unsubList();
+          listeners.delete(sync);
         };
       }, []);
 
@@ -999,16 +1014,18 @@ window.__ModuleLoader__.load({
       const [listCollapsed, setListCollapsed] = React.useState(false);
 
       React.useEffect(() => {
-        const syncSid = () => {
+        const sync = () => {
           const sid = resolveCurrentSessionId();
           setActiveSid(sid);
+          setTick(t => t + 1);
         };
-        const unsub = globalCtx?.sidebarRight?.mounted?.subscribe(syncSid);
-        const cb = () => setTick(t => t + 1);
-        listeners.add(cb);
+        const unsubMounted = globalCtx?.sidebarRight?.mounted?.subscribe(sync);
+        const unsubList = globalCtx?.sessions?.list?.subscribe(sync);
+        listeners.add(sync);
         return () => {
-          if (unsub) unsub();
-          listeners.delete(cb);
+          if (unsubMounted) unsubMounted();
+          if (unsubList) unsubList();
+          listeners.delete(sync);
         };
       }, []);
 
@@ -1451,9 +1468,9 @@ window.__ModuleLoader__.load({
 
         function ensureTabOpen(sid) {
           const activeSid = resolveCurrentSessionId();
-          if (sid !== activeSid) return;
+          if (sid && activeSid && sid !== activeSid) return;
 
-          const sessionData = getSessionState(sid);
+          const sessionData = getSessionState(sid || activeSid);
           if (sessionData && sessionData.autoOpenOpenedThisTurn) return;
           if (sessionData) sessionData.autoOpenOpenedThisTurn = true;
 
@@ -1462,28 +1479,23 @@ window.__ModuleLoader__.load({
               ctx.sidebarRight.openTab(TAB_KIND);
             }
           } catch (e) {
-            console.warn('[dsh-live-inspector] openTab error:', e);
+            // Safe fallback if sidebar not mounted yet
+            console.debug('[dsh-live-inspector] openTab deferred:', e);
           }
         }
 
-        function handleSessionEvents(sessionId, eventSource) {
-          if (!eventSource || typeof eventSource.getSnapshot !== 'function') return;
-          const snapshot = eventSource.getSnapshot();
-          if (!snapshot || !snapshot.change) return;
-
-          const change = snapshot.change;
-          if (change.kind !== 'append' || !Array.isArray(change.entries)) {
-            return;
-          }
-
+        function processEntries(sessionId, entries, isInitialScan = false) {
+          if (!Array.isArray(entries) || entries.length === 0) return;
           const sessionData = getSessionState(sessionId);
 
-          for (const entry of change.entries) {
+          for (const entry of entries) {
             if (!entry || entry.type !== 'event' || !entry.event) continue;
             const ev = entry.event;
 
             if (ev.type === 'turn/start') {
-              if (sessionData) sessionData.autoOpenOpenedThisTurn = false;
+              if (!isInitialScan && sessionData) {
+                sessionData.autoOpenOpenedThisTurn = false;
+              }
               clearActive(sessionId);
             }
 
@@ -1492,7 +1504,9 @@ window.__ModuleLoader__.load({
               const extracted = extractFilePathAndDiff(toolName, ev.data.arguments);
               if (extracted && extracted.path) {
                 recordFile(sessionId, extracted.path, extracted.status, extracted.line, extracted.diff);
-                ensureTabOpen(sessionId);
+                if (!isInitialScan) {
+                  ensureTabOpen(sessionId);
+                }
               }
             }
 
@@ -1504,18 +1518,18 @@ window.__ModuleLoader__.load({
               }
             }
 
-            if (ev.type === 'step/end' || ev.type === 'turn/end') {
+            if (ev.type === 'step/end' || ev.type === 'turn/end' || ev.type === 'workspace/changes') {
               clearActive(sessionId);
             }
 
             if (ev.type === 'workspace/changes' && ev.data && typeof ev.data.turn === 'number') {
-              clearActive(sessionId);
               if (sessionData) {
                 sessionData.reviewUrl = 'dsh-resource://changes-review/session/' + encodeSegment(sessionId) + '/' + ev.seq + '/' + ev.data.turn;
-                notify();
               }
             }
           }
+
+          notify();
         }
 
         function bindSession(sessionId) {
@@ -1524,8 +1538,22 @@ window.__ModuleLoader__.load({
           try {
             const binding = ctx.sessions?.binding(sessionId);
             if (binding && binding.eventSource && typeof binding.eventSource.subscribe === 'function') {
+              // 1. Scan historical entries immediately upon bind
+              const initialSnapshot = binding.eventSource.getSnapshot();
+              if (initialSnapshot && Array.isArray(initialSnapshot.entries)) {
+                processEntries(sessionId, initialSnapshot.entries, true);
+              }
+
+              // 2. Subscribe to subsequent real-time changes
               const unsub = binding.eventSource.subscribe(() => {
-                handleSessionEvents(sessionId, binding.eventSource);
+                const snapshot = binding.eventSource.getSnapshot();
+                if (!snapshot) return;
+                const change = snapshot.change;
+                if (change && Array.isArray(change.entries)) {
+                  processEntries(sessionId, change.entries, false);
+                } else if (Array.isArray(snapshot.entries)) {
+                  processEntries(sessionId, snapshot.entries, false);
+                }
               });
               sessionUnsubscribes.set(sessionId, unsub);
             }
@@ -1534,6 +1562,34 @@ window.__ModuleLoader__.load({
           }
         }
 
+        function syncAllSessions() {
+          try {
+            const list = ctx.sessions?.list?.getSnapshot();
+            if (list && list.byId) {
+              for (const id in list.byId) {
+                bindSession(id);
+              }
+            }
+          } catch (e) {
+            console.warn('[dsh-live-inspector] syncAllSessions error:', e);
+          }
+        }
+
+        // Subscribe to sessions.list to automatically bind all sessions
+        if (ctx.sessions?.list) {
+          ctx.effect(() => {
+            const unsub = ctx.sessions.list.subscribe(() => {
+              syncAllSessions();
+              notify();
+            });
+            syncAllSessions();
+            return () => {
+              if (unsub) unsub();
+            };
+          }, 'dsh-live-inspector: all sessions list subscriber');
+        }
+
+        // Watch active session on screen
         if (ctx.sidebarRight && ctx.sidebarRight.mounted) {
           ctx.effect(() => {
             const unsub = ctx.sidebarRight.mounted.subscribe(() => {
@@ -1553,7 +1609,7 @@ window.__ModuleLoader__.load({
             }
 
             return () => {
-              unsub();
+              if (unsub) unsub();
               for (const [, release] of sessionUnsubscribes) {
                 try {
                   release();
