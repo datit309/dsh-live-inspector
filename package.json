@@ -1,0 +1,25 @@
+{
+  "name": "dsh-live-inspector",
+  "version": "1.0.0",
+  "description": "Auto-monitor and reveal active file operations and changes in DSH right sidebar",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-session"
+      ]
+    }
+  }
+}
